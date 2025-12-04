@@ -1,0 +1,514 @@
+<?php
+if (!defined('ABSPATH')) exit;
+
+/**
+ * Système d'envoi quotidien automatique à 16h00
+ * Message aux élèves en retard du jour
+ */
+
+// Définir l'heure d'envoi (16h00)
+if (!defined('SSR_DAILY_SEND_HOUR')) define('SSR_DAILY_SEND_HOUR', '16:00');
+
+/**
+ * Créer la table pour tracer les envois quotidiens
+ */
+if (!function_exists('ssr_daily_messages_ensure_table')) {
+  function ssr_daily_messages_ensure_table() {
+    global $wpdb;
+    $table = $wpdb->prefix . "smartschool_daily_messages";
+    $charset = $wpdb->get_charset_collate();
+    
+    $sql = "CREATE TABLE IF NOT EXISTS `$table` (
+      `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      `user_identifier` VARCHAR(64) NOT NULL,
+      `class_code` VARCHAR(64) DEFAULT NULL,
+      `last_name` VARCHAR(190) DEFAULT NULL,
+      `first_name` VARCHAR(190) DEFAULT NULL,
+      `date_retard` DATE NOT NULL,
+      `message_content` TEXT NOT NULL,
+      `sent_to_student` TINYINT(1) NOT NULL DEFAULT 0,
+      `sent_to_parent1` TINYINT(1) NOT NULL DEFAULT 0,
+      `sent_to_parent2` TINYINT(1) NOT NULL DEFAULT 0,
+      `sent_at` DATETIME NOT NULL,
+      `status` ENUM('success','failed','partial') NOT NULL DEFAULT 'success',
+      `error_message` TEXT DEFAULT NULL,
+      PRIMARY KEY (`id`),
+      KEY `idx_date` (`date_retard`),
+      KEY `idx_user` (`user_identifier`),
+      KEY `idx_sent_at` (`sent_at`)
+    ) $charset;";
+    
+    $wpdb->query($sql);
+  }
+}
+
+// Créer la table au chargement du plugin
+add_action('init', 'ssr_daily_messages_ensure_table', 10);
+
+/**
+ * Hook cron quotidien à 16h00
+ */
+add_action('ssr_daily_send_messages_cron', 'ssr_daily_send_messages_to_lates');
+
+/**
+ * Planifier le cron à 16h00 si pas encore fait
+ */
+if (!function_exists('ssr_daily_messages_schedule_cron')) {
+  function ssr_daily_messages_schedule_cron() {
+    $hook = 'ssr_daily_send_messages_cron';
+    
+    // Si déjà planifié, ne rien faire
+    if (wp_next_scheduled($hook)) {
+      return;
+    }
+    
+    // Calculer le prochain 16h00
+    $tz = wp_timezone();
+    $now = new DateTime('now', $tz);
+    $target = clone $now;
+    $target->setTime(16, 0, 0);
+    
+    // Si 16h00 est déjà passé aujourd'hui, programmer pour demain
+    if ($target <= $now) {
+      $target->modify('+1 day');
+    }
+    
+    // Convertir en UTC pour wp-cron
+    $target_utc = clone $target;
+    $target_utc->setTimezone(new DateTimeZone('UTC'));
+    $timestamp = $target_utc->getTimestamp();
+    
+    // Planifier l'événement quotidien
+    wp_schedule_event($timestamp, 'daily', $hook);
+    
+    if (function_exists('ssr_log')) {
+      ssr_log('Cron quotidien 16h planifié pour: ' . $target->format('Y-m-d H:i:s T'), 'info', 'daily-messages');
+    }
+  }
+}
+
+// Planifier au chargement du plugin
+add_action('plugins_loaded', 'ssr_daily_messages_schedule_cron', 25);
+
+/**
+ * Fonction principale : Envoyer les messages quotidiens
+ */
+if (!function_exists('ssr_daily_send_messages_to_lates')) {
+  function ssr_daily_send_messages_to_lates($manual = false) {
+    global $wpdb;
+    
+    // Date du jour
+    $tz = wp_timezone();
+    $today = (new DateTime('now', $tz))->format('Y-m-d');
+    
+    if (function_exists('ssr_log')) {
+      ssr_log('Démarrage envoi quotidien pour le ' . $today . ' (manuel=' . ($manual ? 'oui' : 'non') . ')', 'info', 'daily-messages');
+    }
+    
+    // Récupérer les élèves en retard aujourd'hui
+    if (!function_exists('ssr_fetch_retards_by_date')) {
+      if (function_exists('ssr_log')) {
+        ssr_log('Fonction ssr_fetch_retards_by_date introuvable', 'error', 'daily-messages');
+      }
+      return ['error' => 'Fonction manquante'];
+    }
+    
+    $retards = ssr_fetch_retards_by_date($today);
+    
+    if (empty($retards)) {
+      if (function_exists('ssr_log')) {
+        ssr_log('Aucun retard détecté pour le ' . $today, 'info', 'daily-messages');
+      }
+      return ['sent' => 0, 'message' => 'Aucun retard aujourd\'hui'];
+    }
+    
+    // Vérifier qu'on n'a pas déjà envoyé aujourd'hui (sauf si manuel)
+    if (!$manual) {
+      $already_sent = $wpdb->get_var($wpdb->prepare("
+        SELECT COUNT(*) 
+        FROM " . $wpdb->prefix . "smartschool_daily_messages 
+        WHERE date_retard = %s
+      ", $today));
+      
+      if ($already_sent > 0) {
+        if (function_exists('ssr_log')) {
+          ssr_log('Messages déjà envoyés aujourd\'hui (' . $already_sent . ')', 'warning', 'daily-messages');
+        }
+        return ['sent' => 0, 'message' => 'Déjà envoyé aujourd\'hui'];
+      }
+    }
+    
+    // Message standard
+    $message_template = "Bonjour,
+
+Tu as été en retard aujourd'hui.
+
+Tu seras donc privé de sortie à la prochaine pause de midi.
+
+Merci de te présenter à l'accueil à 13h05.
+
+Cordialement,
+L'équipe éducative";
+    
+    // Signature configurable (peut être modifiée via un filtre)
+    $signature = apply_filters('ssr_daily_message_signature', 'L\'équipe éducative');
+    $message_template = str_replace('L\'équipe éducative', $signature, $message_template);
+    
+    // Titre du message
+    $title = apply_filters('ssr_daily_message_title', 'Retard - Interdiction de sortir');
+    
+    // Expéditeur
+    $sender = function_exists('ssr_get_option') 
+      ? ssr_get_option(SSR_OPT_SENDER, 'Null') 
+      : 'Null';
+    
+    $stats = [
+      'total' => count($retards),
+      'sent' => 0,
+      'failed' => 0,
+      'partial' => 0,
+      'errors' => [],
+    ];
+    
+    // Envoyer à chaque élève
+    foreach ($retards as $retard) {
+      $uid = $retard['userIdentifier'] ?? '';
+      
+      if (empty($uid)) {
+        $stats['failed']++;
+        continue;
+      }
+      
+      $class = $retard['class_code'] ?? '';
+      $ln = $retard['last_name'] ?? '';
+      $fn = $retard['first_name'] ?? '';
+      
+      // Personnaliser le message (optionnel)
+      $message = $message_template;
+      $message = str_replace('{prenom}', $fn, $message);
+      $message = str_replace('{nom}', $ln, $message);
+      $message = str_replace('{classe}', $class, $message);
+      
+      // Tentative d'envoi
+      $sent_student = false;
+      $sent_parent1 = false;
+      $sent_parent2 = false;
+      $error = null;
+      
+      // 1) Envoyer à l'élève (compte principal)
+      if (function_exists('ssr_api_send_message')) {
+        $result = ssr_api_send_message(
+          $uid,        // userIdentifier
+          $title,      // titre
+          $message,    // message
+          $sender,     // expéditeur
+          false,       // copyToLVS
+          null,        // attachments
+          null         // coaccount (compte principal = null)
+        );
+        
+        if (!is_wp_error($result)) {
+          $sent_student = true;
+        } else {
+          $error = $result->get_error_message();
+        }
+      }
+      
+      // 2) Envoyer aux parents (coaccount 1 et 2)
+      if (function_exists('ssr_api_send_message')) {
+        // Parent 1 (coaccount 1)
+        $result_p1 = ssr_api_send_message($uid, $title, $message, $sender, false, null, 1);
+        if (!is_wp_error($result_p1)) {
+          $sent_parent1 = true;
+        }
+        
+        // Parent 2 (coaccount 2)
+        $result_p2 = ssr_api_send_message($uid, $title, $message, $sender, false, null, 2);
+        if (!is_wp_error($result_p2)) {
+          $sent_parent2 = true;
+        }
+      }
+      
+      // Déterminer le statut
+      $status = 'failed';
+      if ($sent_student && $sent_parent1 && $sent_parent2) {
+        $status = 'success';
+        $stats['sent']++;
+      } elseif ($sent_student || $sent_parent1 || $sent_parent2) {
+        $status = 'partial';
+        $stats['partial']++;
+      } else {
+        $stats['failed']++;
+        $stats['errors'][] = $fn . ' ' . $ln . ': ' . ($error ?: 'Échec complet');
+      }
+      
+      // Enregistrer dans la base de données
+      $wpdb->insert(
+        $wpdb->prefix . "smartschool_daily_messages",
+        [
+          'user_identifier' => $uid,
+          'class_code' => $class,
+          'last_name' => $ln,
+          'first_name' => $fn,
+          'date_retard' => $today,
+          'message_content' => $message,
+          'sent_to_student' => $sent_student ? 1 : 0,
+          'sent_to_parent1' => $sent_parent1 ? 1 : 0,
+          'sent_to_parent2' => $sent_parent2 ? 1 : 0,
+          'sent_at' => current_time('mysql'),
+          'status' => $status,
+          'error_message' => $error,
+        ],
+        ['%s', '%s', '%s', '%s', '%s', '%s', '%d', '%d', '%d', '%s', '%s', '%s']
+      );
+    }
+    
+    // Log du résultat
+    if (function_exists('ssr_log')) {
+      ssr_log(
+        sprintf(
+          'Envoi quotidien terminé: %d/%d réussis, %d partiels, %d échecs',
+          $stats['sent'],
+          $stats['total'],
+          $stats['partial'],
+          $stats['failed']
+        ),
+        'info',
+        'daily-messages'
+      );
+      
+      if (!empty($stats['errors'])) {
+        ssr_log('Erreurs: ' . implode(' | ', $stats['errors']), 'error', 'daily-messages');
+      }
+    }
+    
+    return $stats;
+  }
+}
+
+/**
+ * Déclenchement manuel via l'admin
+ */
+add_action('admin_post_ssr_manual_daily_send', function() {
+  if (!current_user_can('manage_options')) {
+    wp_die('Accès refusé');
+  }
+  
+  check_admin_referer('ssr_manual_daily_send');
+  
+  $result = ssr_daily_send_messages_to_lates(true);
+  
+  $message = sprintf(
+    'Envoi manuel terminé : %d/%d réussis, %d partiels, %d échecs',
+    $result['sent'] ?? 0,
+    $result['total'] ?? 0,
+    $result['partial'] ?? 0,
+    $result['failed'] ?? 0
+  );
+  
+  wp_redirect(add_query_arg([
+    'page' => 'ssr-daily-messages',
+    'message' => urlencode($message),
+  ], admin_url('admin.php')));
+  exit;
+});
+
+/**
+ * Page d'administration
+ */
+add_action('admin_menu', function() {
+  add_submenu_page(
+    'ssr-settings',
+    'Messages quotidiens 16h',
+    'Messages 16h',
+    'manage_options',
+    'ssr-daily-messages',
+    'ssr_daily_messages_admin_page'
+  );
+});
+
+function ssr_daily_messages_admin_page() {
+  global $wpdb;
+  $table = $wpdb->prefix . "smartschool_daily_messages";
+  
+  // Stats du jour
+  $today = current_time('Y-m-d');
+  $today_sent = $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM `$table` WHERE date_retard = %s", $today));
+  $today_success = $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM `$table` WHERE date_retard = %s AND status = 'success'", $today));
+  $today_failed = $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM `$table` WHERE date_retard = %s AND status = 'failed'", $today));
+  
+  // Prochain envoi
+  $next_run = wp_next_scheduled('ssr_daily_send_messages_cron');
+  $next_run_str = $next_run ? date_i18n('d/m/Y à H:i', $next_run + (get_option('gmt_offset') * HOUR_IN_SECONDS)) : 'Non planifié';
+  
+  ?>
+  <div class="wrap">
+    <h1>📤 Messages quotidiens 16h00</h1>
+    
+    <?php if (isset($_GET['message'])): ?>
+      <div class="notice notice-success is-dismissible">
+        <p><?php echo esc_html(urldecode($_GET['message'])); ?></p>
+      </div>
+    <?php endif; ?>
+    
+    <!-- Informations système -->
+    <div style="background: #fff; border-left: 4px solid #f57c00; padding: 20px; margin: 20px 0; border-radius: 4px;">
+      <h2 style="margin-top: 0;">ℹ️ Informations</h2>
+      <table class="form-table">
+        <tr>
+          <th>⏰ Heure d'envoi configurée</th>
+          <td><strong style="font-size: 18px; color: #f57c00;"><?php echo esc_html(SSR_DAILY_SEND_HOUR); ?></strong></td>
+        </tr>
+        <tr>
+          <th>📅 Prochain envoi automatique</th>
+          <td><strong><?php echo esc_html($next_run_str); ?></strong></td>
+        </tr>
+        <tr>
+          <th>📊 Messages envoyés aujourd'hui</th>
+          <td>
+            <strong><?php echo intval($today_sent); ?></strong> message(s)
+            <?php if ($today_sent > 0): ?>
+              <br>
+              <small style="color: green;">✅ <?php echo intval($today_success); ?> réussis</small>
+              <?php if ($today_failed > 0): ?>
+                <small style="color: red;"> • ❌ <?php echo intval($today_failed); ?> échecs</small>
+              <?php endif; ?>
+            <?php endif; ?>
+          </td>
+        </tr>
+      </table>
+    </div>
+    
+    <!-- Message type -->
+    <div style="background: #f0f8ff; border-left: 4px solid #2196F3; padding: 20px; margin: 20px 0; border-radius: 4px;">
+      <h2 style="margin-top: 0;">📝 Message envoyé</h2>
+      <div style="background: #fff; padding: 15px; border-radius: 4px; font-family: monospace; white-space: pre-line;">Bonjour,
+
+Tu as été en retard aujourd'hui.
+
+Tu seras donc privé de sortie à la prochaine pause de midi.
+
+Merci de te présenter à l'accueil à 13h05.
+
+Cordialement,
+L'équipe éducative</div>
+      <p style="margin-top: 15px; color: #666;">
+        <em>Ce message est envoyé automatiquement chaque jour à 16h00 à tous les élèves en retard du jour.</em>
+      </p>
+    </div>
+    
+    <!-- Action manuelle -->
+    <div style="background: #fff; padding: 20px; margin: 20px 0; border: 2px solid #f57c00; border-radius: 8px;">
+      <h2 style="margin-top: 0;">⚡ Envoi manuel immédiat</h2>
+      <p>Envoyer maintenant les messages aux élèves en retard <strong>aujourd'hui</strong> (<?php echo date_i18n('d/m/Y'); ?>).</p>
+      <form method="post" action="<?php echo admin_url('admin-post.php'); ?>" onsubmit="return confirm('Êtes-vous sûr de vouloir envoyer les messages maintenant ?');">
+        <input type="hidden" name="action" value="ssr_manual_daily_send">
+        <?php wp_nonce_field('ssr_manual_daily_send'); ?>
+        <button type="submit" class="button button-primary button-large">
+          📤 Envoyer maintenant
+        </button>
+      </form>
+    </div>
+    
+    <!-- Historique récent -->
+    <h2>📜 Historique des 7 derniers jours</h2>
+    <?php
+    $history = $wpdb->get_results("
+      SELECT 
+        date_retard,
+        COUNT(*) as total,
+        SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success,
+        SUM(CASE WHEN status = 'partial' THEN 1 ELSE 0 END) as partial,
+        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+        MIN(sent_at) as first_sent
+      FROM `$table`
+      WHERE date_retard >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
+      GROUP BY date_retard
+      ORDER BY date_retard DESC
+    ", ARRAY_A);
+    
+    if (!$history) {
+      echo '<p>Aucun envoi dans les 7 derniers jours.</p>';
+    } else {
+      ?>
+      <table class="wp-list-table widefat fixed striped">
+        <thead>
+          <tr>
+            <th>Date</th>
+            <th>Total envoyés</th>
+            <th>✅ Réussis</th>
+            <th>⚠️ Partiels</th>
+            <th>❌ Échecs</th>
+            <th>Envoyé à</th>
+          </tr>
+        </thead>
+        <tbody>
+          <?php foreach ($history as $row): ?>
+            <tr>
+              <td><strong><?php echo date_i18n('d/m/Y', strtotime($row['date_retard'])); ?></strong></td>
+              <td><?php echo intval($row['total']); ?></td>
+              <td style="color: green;"><strong><?php echo intval($row['success']); ?></strong></td>
+              <td style="color: orange;"><?php echo intval($row['partial']); ?></td>
+              <td style="color: red;"><?php echo intval($row['failed']); ?></td>
+              <td><?php echo $row['first_sent'] ? date_i18n('H:i', strtotime($row['first_sent'])) : '—'; ?></td>
+            </tr>
+          <?php endforeach; ?>
+        </tbody>
+      </table>
+      <?php
+    }
+    ?>
+    
+    <!-- Détails du jour -->
+    <h2>📋 Détails d'aujourd'hui</h2>
+    <?php
+    $today_details = $wpdb->get_results($wpdb->prepare("
+      SELECT * FROM `$table` 
+      WHERE date_retard = %s 
+      ORDER BY sent_at DESC
+    ", $today), ARRAY_A);
+    
+    if (!$today_details) {
+      echo '<p>Aucun message envoyé aujourd\'hui.</p>';
+    } else {
+      ?>
+      <table class="wp-list-table widefat fixed striped">
+        <thead>
+          <tr>
+            <th>Élève</th>
+            <th>Classe</th>
+            <th>👤 Élève</th>
+            <th>👨 Parent 1</th>
+            <th>👩 Parent 2</th>
+            <th>Statut</th>
+            <th>Envoyé à</th>
+          </tr>
+        </thead>
+        <tbody>
+          <?php foreach ($today_details as $detail): ?>
+            <tr>
+              <td><?php echo esc_html($detail['first_name'] . ' ' . $detail['last_name']); ?></td>
+              <td><?php echo esc_html($detail['class_code']); ?></td>
+              <td><?php echo $detail['sent_to_student'] ? '✅' : '❌'; ?></td>
+              <td><?php echo $detail['sent_to_parent1'] ? '✅' : '❌'; ?></td>
+              <td><?php echo $detail['sent_to_parent2'] ? '✅' : '❌'; ?></td>
+              <td>
+                <?php if ($detail['status'] === 'success'): ?>
+                  <span style="color: green;">✅ Réussi</span>
+                <?php elseif ($detail['status'] === 'partial'): ?>
+                  <span style="color: orange;">⚠️ Partiel</span>
+                <?php else: ?>
+                  <span style="color: red;">❌ Échec</span>
+                <?php endif; ?>
+              </td>
+              <td><?php echo date_i18n('H:i:s', strtotime($detail['sent_at'])); ?></td>
+            </tr>
+          <?php endforeach; ?>
+        </tbody>
+      </table>
+      <?php
+    }
+    ?>
+  </div>
+  <?php
+}
